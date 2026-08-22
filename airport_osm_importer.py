@@ -1,187 +1,87 @@
+# ------------------------------------------------------------------------------
+# Airport OSM & WSAirports Importer for Blender
+#
+# Copyright (C) 2026 Martin F, Wings Simulations, and Contributors
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 2 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301, USA.
+#
+# DATASET ATTRIBUTIONS AND MANDATORY LEGAL NOTICE (GPLv2 & ODbL):
+# 1. X-Plane Airport Scenery Gateway: (C) Laminar Research & Community Authors
+#    Upstream: https://gateway.x-plane.com/ (GPLv2)
+# 2. Wings Simulations Dataset: (C) 2026 Wings Simulations (GPLv2)
+# 3. OpenStreetMap Buildings: (C) OpenStreetMap contributors (ODbL / CC-BY-SA)
+#
+# MANDATORY REQUIREMENT: Any derivative 3D scenery, renders, game mods, or files 
+# produced using this dataset MUST include clear attribution to BOTH Laminar Research 
+# (X-Plane Airport Scenery Gateway) and Wings Simulations under the terms of GPLv2. 
+# Unattributed commercial redistribution or license violations are subject to DMCA takedown.
+# ------------------------------------------------------------------------------
+
 bl_info = {
-    "name": "Airport OSM Importer",
-    "author": "Martin F",
-    "version": (1, 2, 0),
+    "name": "Airport OSM & WSAirports Importer",
+    "author": "Martin F & Wings Simulations",
+    "version": (2, 4, 0),
     "blender": (3, 0, 0),
-    "location": "View3D > Sidebar > Airport OSM",
-    "description": "Generate a base 3D model of an airport (runways, taxiways, aprons/tarmac, buildings) from OpenStreetMap data via the Overpass API",
+    "location": "View3D > Sidebar > Airport Importer",
+    "description": "Generate high-accuracy base 3D models using chunked .wscairport data with OSM 3D buildings",
     "category": "Import-Export",
+    "license": "GPL-2.0-or-later",
 }
 
 import bpy
 import bmesh
 import math
 import json
-import csv
-import io
+import gzip
 import os
-import time
-import threading
-import queue
+import webbrowser
 import urllib.request
 import urllib.error
-from bpy.props import StringProperty, FloatProperty, CollectionProperty, BoolProperty, PointerProperty
+from bpy.props import StringProperty, FloatProperty, BoolProperty, EnumProperty, PointerProperty
 from bpy.types import Operator, Panel, PropertyGroup
 
-AIRPORTS_CSV_URL = "https://davidmegginson.github.io/ourairports-data/airports.csv"
+EARTH_RADIUS = 6378137.0
+GITHUB_REPO_URL = "https://github.com/WingsSimulations/wsairports-database"
 OVERPASS_ENDPOINTS = [
     "https://overpass-api.de/api/interpreter",
     "https://overpass.kumi.systems/api/interpreter",
 ]
 
-_AIRPORT_DB = {}
-
-EARTH_RADIUS = 6378137.0
-
-DEFAULT_WIDTHS = {
-    "runway": 45.0,
-    "taxiway": 23.0,
-    "taxilane": 18.0,
-}
 BUILDING_DEFAULT_HEIGHT = 6.0
 LEVEL_HEIGHT = 3.0
 
+_WSA_INDEX = {}
+_LOADED_DB_PATH = ""
 
-def get_data_dir():
-    return bpy.utils.user_resource('CONFIG', path="airport_osm", create=True)
-
-
-def get_cache_path():
-    return os.path.join(get_data_dir(), "airports.json")
-
-
-def make_display_string(rec):
-    code = rec.get("icao") or rec.get("iata") or ""
-    label = f"{rec['name']}"
-    if code:
-        label += f" ({code})"
-    if rec.get("country"):
-        label += f" - {rec['country']}"
-    return label
-
-
-def parse_airport_csv(raw_text):
-    reader = csv.DictReader(io.StringIO(raw_text))
-    records = {}
-    allowed_types = {"large_airport", "medium_airport", "small_airport"}
-    for row in reader:
-        try:
-            if row.get("type") not in allowed_types:
-                continue
-            icao = (row.get("icao_code") or row.get("gps_code") or row.get("ident") or "").strip()
-            iata = (row.get("iata_code") or "").strip()
-            if not icao and not iata:
-                continue
-            name = (row.get("name") or "").strip()
-            lat = float(row.get("latitude_deg"))
-            lon = float(row.get("longitude_deg"))
-            country = (row.get("iso_country") or "").strip()
-            rec = {
-                "icao": icao,
-                "iata": iata,
-                "name": name,
-                "lat": lat,
-                "lon": lon,
-                "country": country,
-                "type": row.get("type"),
-            }
-            records[make_display_string(rec)] = rec
-        except (ValueError, TypeError, KeyError):
-            continue
-    return records
+SURFACE_COLORS = {
+    "runway_asphalt": (0.04, 0.04, 0.045),
+    "runway_concrete": (0.45, 0.44, 0.42),
+    "taxiway_asphalt": (0.07, 0.07, 0.08),
+    "taxiway_concrete": (0.50, 0.49, 0.47),
+    "apron": (0.58, 0.57, 0.54),
+    "road": (0.03, 0.03, 0.03),
+    "paint_white": (0.9, 0.9, 0.9),
+    "paint_yellow": (0.85, 0.65, 0.05),
+    "paint_red": (0.8, 0.05, 0.05),
+    "helipad": (0.2, 0.2, 0.22),
+    "windsock": (0.85, 0.3, 0.05),
+    "building": (0.6, 0.6, 0.62),
+}
 
 
-def load_airport_database():
-    global _AIRPORT_DB
-    path = get_cache_path()
-    if not os.path.exists(path):
-        _AIRPORT_DB = {}
-        return 0
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            cache = json.load(f)
-        _AIRPORT_DB = cache.get("airports", {})
-        return len(_AIRPORT_DB)
-    except (json.JSONDecodeError, OSError):
-        _AIRPORT_DB = {}
-        return 0
-
-
-def database_last_updated_str():
-    path = get_cache_path()
-    if not os.path.exists(path):
-        return None
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            cache = json.load(f)
-        ts = cache.get("downloaded_at")
-        if ts:
-            return time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
-    except (json.JSONDecodeError, OSError):
-        pass
-    return None
-
-
-def refresh_search_collection(context):
-    wm = context.window_manager
-    wm.airport_osm_items.clear()
-    for key in sorted(_AIRPORT_DB.keys()):
-        item = wm.airport_osm_items.add()
-        item.name = key
-
-
-def build_query(search_term):
-    escaped = search_term.replace('"', '\\"')
-    query = f"""
-[out:json][timeout:180];
-(
-  node["aeroway"="aerodrome"]["name"~"{escaped}",i];
-  way["aeroway"="aerodrome"]["name"~"{escaped}",i];
-  relation["aeroway"="aerodrome"]["name"~"{escaped}",i];
-  node["aeroway"="aerodrome"]["icao"="{escaped}"];
-  way["aeroway"="aerodrome"]["icao"="{escaped}"];
-  relation["aeroway"="aerodrome"]["icao"="{escaped}"];
-  node["aeroway"="aerodrome"]["iata"="{escaped}"];
-  way["aeroway"="aerodrome"]["iata"="{escaped}"];
-  relation["aeroway"="aerodrome"]["iata"="{escaped}"];
-);
-out center 1;
-"""
-    return query.strip()
-
-
-def build_detail_query(lat, lon, radius_m):
-    query = f"""
-[out:json][timeout:180];
-(
-  way["aeroway"](around:{radius_m},{lat},{lon});
-  relation["aeroway"](around:{radius_m},{lat},{lon});
-  way["building"](around:{radius_m},{lat},{lon});
-  relation["building"](around:{radius_m},{lat},{lon});
-);
-out body;
->;
-out skel qt;
-"""
-    return query.strip()
-
-
-def run_overpass_query(query, timeout=180):
-    last_err = None
-    for endpoint in OVERPASS_ENDPOINTS:
-        try:
-            payload = ("data=" + urllib.request.quote(query)).encode("utf-8")
-            req = urllib.request.Request(endpoint, data=payload, method="POST")
-            req.add_header("Content-Type", "application/x-www-form-urlencoded")
-            req.add_header("User-Agent", "Blender-Airport-OSM-Importer/1.0")
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                raw = resp.read()
-                return json.loads(raw.decode("utf-8"))
-        except Exception as e:
-            last_err = e
-            continue
-    raise RuntimeError(f"All Overpass endpoints failed: {last_err}")
-
+# --- Coordinate Math ---
 
 def latlon_to_local_xy(lat, lon, origin_lat, origin_lon, scale=1.0):
     origin_lat_rad = math.radians(origin_lat)
@@ -190,138 +90,37 @@ def latlon_to_local_xy(lat, lon, origin_lat, origin_lon, scale=1.0):
     return x, y
 
 
-class OSMData:
-    def __init__(self, elements):
-        self.nodes = {}
-        self.ways = {}
-        self.relations = {}
-        for el in elements:
-            if el["type"] == "node":
-                self.nodes[el["id"]] = (el["lat"], el["lon"])
-            elif el["type"] == "way":
-                self.ways[el["id"]] = el
-            elif el["type"] == "relation":
-                self.relations[el["id"]] = el
+# --- Overpass OSM Building Fetcher ---
 
-    def way_coords(self, way):
-        coords = []
-        for nid in way.get("nodes", []):
-            if nid in self.nodes:
-                coords.append(self.nodes[nid])
-        return coords
-
-
-def make_collection(name):
-    if name in bpy.data.collections:
-        return bpy.data.collections[name]
-    col = bpy.data.collections.new(name)
-    bpy.context.scene.collection.children.link(col)
-    return col
-
-
-def get_or_create_material(name, color, roughness=0.9):
-    mat = bpy.data.materials.get(name)
-    if mat is None:
-        mat = bpy.data.materials.new(name)
-        mat.use_nodes = True
-        bsdf = mat.node_tree.nodes.get("Principled BSDF")
-        if bsdf:
-            bsdf.inputs["Base Color"].default_value = (*color, 1.0)
-            if "Roughness" in bsdf.inputs:
-                bsdf.inputs["Roughness"].default_value = roughness
-    return mat
-
-
-def build_flat_polygon_mesh(name, coords_xy, elevation, collection, material=None, extrude=0.0):
-    if len(coords_xy) < 3:
-        return None
-    if coords_xy[0] == coords_xy[-1]:
-        coords_xy = coords_xy[:-1]
-    if len(coords_xy) < 3:
-        return None
-
-    mesh = bpy.data.meshes.new(name)
-    obj = bpy.data.objects.new(name, mesh)
-    collection.objects.link(obj)
-
-    bm = bmesh.new()
-    verts = [bm.verts.new((x, y, elevation)) for x, y in coords_xy]
-    try:
-        face = bm.faces.new(verts)
-    except ValueError:
-        bm.free()
-        return None
-
-    if extrude > 0.0:
-        bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
-        ret = bmesh.ops.extrude_face_region(bm, geom=[face])
-        extruded_verts = [g for g in ret["geom"] if isinstance(g, bmesh.types.BMVert)]
-        bmesh.ops.translate(bm, vec=(0, 0, extrude), verts=extruded_verts)
-
-    bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
-    bm.to_mesh(mesh)
-    bm.free()
-
-    if material:
-        obj.data.materials.append(material)
-
-    return obj
-
-
-def build_line_strip_as_ribbon(name, coords_xy, elevation, width, collection, material=None):
-    if len(coords_xy) < 2:
-        return None
-
-    mesh = bpy.data.meshes.new(name)
-    obj = bpy.data.objects.new(name, mesh)
-    collection.objects.link(obj)
-
-    bm = bmesh.new()
-    left_verts = []
-    right_verts = []
-    half_w = width / 2.0
-
-    for i, (x, y) in enumerate(coords_xy):
-        if i == 0:
-            dx = coords_xy[1][0] - x
-            dy = coords_xy[1][1] - y
-        elif i == len(coords_xy) - 1:
-            dx = x - coords_xy[i - 1][0]
-            dy = y - coords_xy[i - 1][1]
-        else:
-            dx = coords_xy[i + 1][0] - coords_xy[i - 1][0]
-            dy = coords_xy[i + 1][1] - coords_xy[i - 1][1]
-        length = math.hypot(dx, dy)
-        if length == 0:
-            nx, ny = 0, 1
-        else:
-            nx, ny = -dy / length, dx / length
-        left_verts.append(bm.verts.new((x + nx * half_w, y + ny * half_w, elevation)))
-        right_verts.append(bm.verts.new((x - nx * half_w, y - ny * half_w, elevation)))
-
-    for i in range(len(coords_xy) - 1):
+def run_overpass_query(query, timeout=60):
+    last_err = None
+    for endpoint in OVERPASS_ENDPOINTS:
         try:
-            bm.faces.new((left_verts[i], left_verts[i + 1], right_verts[i + 1], right_verts[i]))
-        except ValueError:
+            payload = ("data=" + urllib.request.quote(query)).encode("utf-8")
+            req = urllib.request.Request(endpoint, data=payload, method="POST")
+            req.add_header("Content-Type", "application/x-www-form-urlencoded")
+            req.add_header("User-Agent", "Blender-Airport-WSA-OSM-Importer/2.0")
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                raw = resp.read()
+                return json.loads(raw.decode("utf-8"))
+        except Exception as e:
+            last_err = e
             continue
-
-    bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
-    bm.to_mesh(mesh)
-    bm.free()
-
-    if material:
-        obj.data.materials.append(material)
-
-    return obj
+    raise RuntimeError(f"Overpass endpoints failed: {last_err}")
 
 
-def get_way_width(tags, feature_type, scale=1.0):
-    if "width" in tags:
-        try:
-            return float(tags["width"].split()[0]) * scale
-        except Exception:
-            pass
-    return DEFAULT_WIDTHS.get(feature_type, 20.0) * scale
+def fetch_osm_buildings(lat, lon, radius_m):
+    query = f"""
+[out:json][timeout:60];
+(
+  way["building"](around:{radius_m},{lat},{lon});
+  relation["building"](around:{radius_m},{lat},{lon});
+);
+out body;
+>;
+out skel qt;
+"""
+    return run_overpass_query(query.strip())
 
 
 def get_building_height(tags, scale=1.0):
@@ -338,446 +137,619 @@ def get_building_height(tags, scale=1.0):
     return BUILDING_DEFAULT_HEIGHT * scale
 
 
-def prepare_collections():
-    root_col = make_collection("Airport")
-    col_runways = make_collection("Runways")
-    col_taxiways = make_collection("Taxiways")
-    col_aprons = make_collection("Aprons_Tarmac")
-    col_buildings = make_collection("Buildings")
-    for c in (col_runways, col_taxiways, col_aprons, col_buildings):
-        if c.name not in root_col.children:
-            try:
-                root_col.children.link(c)
-            except Exception:
-                pass
-        if c.name in bpy.context.scene.collection.children:
-            bpy.context.scene.collection.children.unlink(c)
-    return root_col, col_runways, col_taxiways, col_aprons, col_buildings
+# --- Dataset & Chunk Index Resolution ---
+
+def load_master_index(db_folder):
+    global _WSA_INDEX, _LOADED_DB_PATH
+    db_path = bpy.path.abspath(db_folder).strip()
+    if not db_path or not os.path.isdir(db_path):
+        return 0
+
+    index_path = os.path.join(db_path, "airports_index.json")
+    if not os.path.exists(index_path):
+        return 0
+
+    try:
+        with open(index_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        _WSA_INDEX = {entry["icao"].upper(): entry for entry in data if "icao" in entry}
+        _LOADED_DB_PATH = db_path
+        return len(_WSA_INDEX)
+    except Exception as e:
+        print(f"[!] WSAirports Error loading airports_index.json: {e}")
+        _WSA_INDEX = {}
+        return 0
 
 
-def build_task_list(osm, origin_lat, origin_lon, scale=1.0):
-    tasks = []
-    for way_id, way in osm.ways.items():
-        tags = way.get("tags", {})
-        coords_ll = osm.way_coords(way)
-        if len(coords_ll) < 2:
+def fetch_airport_from_chunk(db_folder, icao):
+    icao = icao.strip().upper()
+    if not _WSA_INDEX:
+        load_master_index(db_folder)
+
+    entry = _WSA_INDEX.get(icao)
+    if not entry:
+        return None, f"Airport '{icao}' not found in master index."
+
+    chunk_key = entry.get("chunk")
+    if not chunk_key:
+        return None, f"No chunk reference found for '{icao}'."
+
+    candidate_dirs = [db_folder, os.path.join(db_folder, "chunks")]
+    extensions = [".wscairport", ".chunk.json.gz", ".chunk.json", ".json", ".gz"]
+
+    target_file = None
+    for c_dir in candidate_dirs:
+        for ext in extensions:
+            p = os.path.join(c_dir, f"{chunk_key}{ext}")
+            if os.path.exists(p):
+                target_file = p
+                break
+        if target_file:
+            break
+
+    if not target_file:
+        return None, f"Chunk file for '{chunk_key}' not found in database."
+
+    try:
+        if target_file.endswith(".gz"):
+            with gzip.open(target_file, "rt", encoding="utf-8") as f:
+                chunk_data = json.load(f)
+        else:
+            with open(target_file, "r", encoding="utf-8") as f:
+                chunk_data = json.load(f)
+
+        apt = chunk_data.get(icao)
+        if not apt:
+            return None, f"Airport '{icao}' missing from chunk '{chunk_key}'."
+        return apt, None
+    except Exception as e:
+        return None, f"Error reading chunk '{target_file}': {e}"
+
+
+# --- Geometry & Hierarchy Generation ---
+
+def get_or_create_material(name, color, roughness=0.9):
+    mat = bpy.data.materials.get(name)
+    if mat is None:
+        mat = bpy.data.materials.new(name)
+        mat.use_nodes = True
+        bsdf = mat.node_tree.nodes.get("Principled BSDF")
+        if bsdf:
+            bsdf.inputs["Base Color"].default_value = (*color, 1.0)
+            if "Roughness" in bsdf.inputs:
+                bsdf.inputs["Roughness"].default_value = roughness
+    return mat
+
+
+def make_collection(name, parent=None):
+    if name in bpy.data.collections:
+        col = bpy.data.collections[name]
+    else:
+        col = bpy.data.collections.new(name)
+        if parent is None:
+            bpy.context.scene.collection.children.link(col)
+        else:
+            parent.children.link(col)
+    return col
+
+
+def prepare_airport_hierarchy(root_name="Airport"):
+    root_col = make_collection(root_name)
+    return {
+        "root": root_col,
+        "runways": make_collection("Runways", root_col),
+        "taxiways": make_collection("Taxiways", root_col),
+        "aprons": make_collection("Aprons_Pavements", root_col),
+        "roads": make_collection("Service_Roads", root_col),
+        "markings": make_collection("Markings", root_col),
+        "helipads": make_collection("Helipads", root_col),
+        "gates": make_collection("Gates_Stands", root_col),
+        "jetways": make_collection("Jetways", root_col),
+        "buildings": make_collection("Buildings_OSM", root_col),
+    }
+
+
+def build_complex_polygon(name, rings_xy, elevation, collection, material=None, extrude=0.0):
+    if not rings_xy or len(rings_xy[0]) < 3:
+        return None
+
+    mesh = bpy.data.meshes.new(name)
+    obj = bpy.data.objects.new(name, mesh)
+    collection.objects.link(obj)
+
+    bm = bmesh.new()
+    for ring in rings_xy:
+        clean_pts = ring[:-1] if (len(ring) > 3 and ring[0] == ring[-1]) else ring
+        if len(clean_pts) < 3:
             continue
-        coords_xy = [latlon_to_local_xy(lat, lon, origin_lat, origin_lon, scale) for lat, lon in coords_ll]
-        is_closed = coords_ll[0] == coords_ll[-1] if len(coords_ll) > 2 else False
-        aeroway = tags.get("aeroway")
+        v_list = [bm.verts.new((x, y, elevation)) for x, y in clean_pts]
+        for i in range(len(v_list)):
+            bm.edges.new((v_list[i], v_list[(i + 1) % len(v_list)]))
 
-        if aeroway == "runway":
-            tasks.append(("runway", way_id, tags, coords_xy, is_closed))
-        elif aeroway in ("taxiway", "taxilane"):
-            tasks.append(("taxiway", way_id, tags, coords_xy, is_closed))
-        elif aeroway in ("apron", "tarmac"):
-            tasks.append(("apron", way_id, tags, coords_xy, is_closed))
-        elif "building" in tags:
-            tasks.append(("building", way_id, tags, coords_xy, is_closed))
-    return tasks
+    bm.verts.ensure_lookup_table()
+    bm.edges.ensure_lookup_table()
+
+    bmesh.ops.triangle_fill(bm, use_beauty=True, edges=bm.edges)
+
+    if extrude > 0.0 and bm.faces:
+        bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
+        ret = bmesh.ops.extrude_face_region(bm, geom=list(bm.faces))
+        extruded_verts = [g for g in ret["geom"] if isinstance(g, bmesh.types.BMVert)]
+        bmesh.ops.translate(bm, vec=(0, 0, extrude), verts=extruded_verts)
+
+    bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
+    bm.to_mesh(mesh)
+    bm.free()
+
+    if material:
+        obj.data.materials.append(material)
+    return obj
 
 
-def execute_task(task, cols, mats, scale=1.0):
-    kind, way_id, tags, coords_xy, is_closed = task
-    _, col_runways, col_taxiways, col_aprons, col_buildings = cols
-    mat_runway, mat_taxiway, mat_apron, mat_building = mats
-
-    if kind == "runway":
-        name = f"Runway_{tags.get('ref', way_id)}"
-        width = get_way_width(tags, "runway", scale)
-        if is_closed and len(coords_xy) >= 4:
-            obj = build_flat_polygon_mesh(name, coords_xy, 0.0, col_runways, mat_runway)
-        else:
-            obj = build_line_strip_as_ribbon(name, coords_xy, 0.0, width, col_runways, mat_runway)
-        return "runway" if obj else None
-
-    if kind == "taxiway":
-        name = f"Taxiway_{tags.get('ref', way_id)}"
-        width = get_way_width(tags, tags.get("aeroway"), scale)
-        elev = 0.005 * scale
-        if is_closed and len(coords_xy) >= 4:
-            obj = build_flat_polygon_mesh(name, coords_xy, elev, col_taxiways, mat_taxiway)
-        else:
-            obj = build_line_strip_as_ribbon(name, coords_xy, elev, width, col_taxiways, mat_taxiway)
-        return "taxiway" if obj else None
-
-    if kind == "apron":
-        name = f"Apron_{way_id}"
-        elev = 0.01 * scale
-        if is_closed and len(coords_xy) >= 3:
-            obj = build_flat_polygon_mesh(name, coords_xy, elev, col_aprons, mat_apron)
-            return "apron" if obj else None
+def build_line_strip_ribbon(name, coords_xy, elevation, width, collection, material=None):
+    if len(coords_xy) < 2:
         return None
 
-    if kind == "building":
-        name = tags.get("name", f"Building_{way_id}")
-        height = get_building_height(tags, scale)
-        if is_closed and len(coords_xy) >= 3:
-            obj = build_flat_polygon_mesh(name, coords_xy, 0.0, col_buildings, mat_building, extrude=height)
-            return "building" if obj else None
+    mesh = bpy.data.meshes.new(name)
+    obj = bpy.data.objects.new(name, mesh)
+    collection.objects.link(obj)
+
+    bm = bmesh.new()
+    left_verts, right_verts = [], []
+    half_w = width / 2.0
+
+    for i, (x, y) in enumerate(coords_xy):
+        if i == 0:
+            dx, dy = coords_xy[1][0] - x, coords_xy[1][1] - y
+        elif i == len(coords_xy) - 1:
+            dx, dy = x - coords_xy[i - 1][0], y - coords_xy[i - 1][1]
+        else:
+            dx, dy = coords_xy[i + 1][0] - coords_xy[i - 1][0], coords_xy[i + 1][1] - coords_xy[i - 1][1]
+
+        length = math.hypot(dx, dy)
+        nx, ny = (0, 1) if length == 0 else (-dy / length, dx / length)
+        left_verts.append(bm.verts.new((x + nx * half_w, y + ny * half_w, elevation)))
+        right_verts.append(bm.verts.new((x - nx * half_w, y - ny * half_w, elevation)))
+
+    for i in range(len(coords_xy) - 1):
+        try:
+            bm.faces.new((left_verts[i], left_verts[i + 1], right_verts[i + 1], right_verts[i]))
+        except ValueError:
+            continue
+
+    bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
+    bm.to_mesh(mesh)
+    bm.free()
+
+    if material:
+        obj.data.materials.append(material)
+    return obj
+
+
+def build_accurate_runway(rwy_data, origin_lat, origin_lon, scale, collection, mats):
+    ends = rwy_data.get("ends", [])
+    if len(ends) < 2:
         return None
 
-    return None
+    r1, r2 = ends[0], ends[1]
+    name = f"Runway_{r1.get('name', '01')}_{r2.get('name', '19')}"
+    width = float(rwy_data.get("width_m", 45.0)) * scale
+
+    p1 = latlon_to_local_xy(float(r1["lat"]), float(r1["lon"]), origin_lat, origin_lon, scale)
+    p2 = latlon_to_local_xy(float(r2["lat"]), float(r2["lon"]), origin_lat, origin_lon, scale)
+
+    dx, dy = p2[0] - p1[0], p2[1] - p1[1]
+    length = math.hypot(dx, dy)
+    if length == 0:
+        return None
+
+    ux, uy = dx / length, dy / length
+    nx, ny = -uy, ux
+    half_w = width / 2.0
+
+    c1 = (p1[0] + nx * half_w, p1[1] + ny * half_w)
+    c2 = (p2[0] + nx * half_w, p2[1] + ny * half_w)
+    c3 = (p2[0] - nx * half_w, p2[1] - ny * half_w)
+    c4 = (p1[0] - nx * half_w, p1[1] - ny * half_w)
+
+    surf_type = rwy_data.get("surface", 1)
+    mat = mats["rwy_concrete"] if surf_type == 2 else mats["rwy_asphalt"]
+    return build_complex_polygon(name, [[c1, c2, c3, c4]], 0.002 * scale, collection, mat)
 
 
-class AirportSearchItem(PropertyGroup):
-    pass
+def generate_wsairport_model(apt_data, scale=0.1, props=None):
+    center = apt_data.get("center", [0.0, 0.0])
+    origin_lat, origin_lon = float(center[0]), float(center[1])
+    icao = apt_data.get("icao") or apt_data.get("id") or "Airport"
+    cols = prepare_airport_hierarchy(f"Airport_{icao}")
 
+    mats = {
+        "rwy_asphalt": get_or_create_material("WSA_Runway_Asphalt", SURFACE_COLORS["runway_asphalt"]),
+        "rwy_concrete": get_or_create_material("WSA_Runway_Concrete", SURFACE_COLORS["runway_concrete"]),
+        "taxi_asphalt": get_or_create_material("WSA_Taxiway_Asphalt", SURFACE_COLORS["taxiway_asphalt"]),
+        "taxi_concrete": get_or_create_material("WSA_Taxiway_Concrete", SURFACE_COLORS["taxiway_concrete"]),
+        "apron": get_or_create_material("WSA_Apron", SURFACE_COLORS["apron"]),
+        "road": get_or_create_material("WSA_Road", SURFACE_COLORS["road"]),
+        "paint_white": get_or_create_material("WSA_Line_White", SURFACE_COLORS["paint_white"]),
+        "paint_yellow": get_or_create_material("WSA_Line_Yellow", SURFACE_COLORS["paint_yellow"]),
+        "paint_red": get_or_create_material("WSA_Line_Red", SURFACE_COLORS["paint_red"]),
+        "helipad": get_or_create_material("WSA_Helipad", SURFACE_COLORS["helipad"]),
+        "windsock": get_or_create_material("WSA_Windsock", SURFACE_COLORS["windsock"]),
+        "building": get_or_create_material("OSM_Building_Generic", SURFACE_COLORS["building"]),
+    }
+
+    counts = {"runways": 0, "taxiways": 0, "markings": 0, "gates": 0, "jetways": 0, "helipads": 0, "buildings": 0}
+
+    # 1. Runways
+    if props.import_runways:
+        for rwy in apt_data.get("runways", []):
+            if build_accurate_runway(rwy, origin_lat, origin_lon, scale, cols["runways"], mats):
+                counts["runways"] += 1
+
+    # 2. Taxiways, Aprons & Service Roads
+    if props.import_taxiways:
+        for idx, poly in enumerate(apt_data.get("taxiways", [])):
+            rings_xy = []
+            for ring in poly.get("rings", []):
+                ring_xy = [latlon_to_local_xy(float(pt[0]), float(pt[1]), origin_lat, origin_lon, scale) for pt in ring if len(pt) >= 2]
+                if len(ring_xy) >= 3:
+                    rings_xy.append(ring_xy)
+
+            if not rings_xy:
+                continue
+
+            kind = poly.get("kind", "taxiway")
+            surf = poly.get("surface", 1)
+            name = poly.get("name") or f"{kind.capitalize()}_{idx + 1}"
+
+            if kind == "apron":
+                mat, target_col, elev = mats["apron"], cols["aprons"], 0.001 * scale
+            elif kind == "road":
+                mat, target_col, elev = mats["road"], cols["roads"], 0.003 * scale
+            else:
+                mat = mats["taxi_concrete"] if surf == 2 else mats["taxi_asphalt"]
+                target_col, elev = cols["taxiways"], 0.0015 * scale
+
+            if build_complex_polygon(name, rings_xy, elev, target_col, mat):
+                counts["taxiways"] += 1
+
+    # 3. Markings
+    if props.import_markings:
+        for idx, line in enumerate(apt_data.get("markings", [])):
+            pts_xy = [latlon_to_local_xy(float(p[0]), float(p[1]), origin_lat, origin_lon, scale) for p in line.get("points", []) if len(p) >= 2]
+            if len(pts_xy) < 2:
+                continue
+            paint_type = line.get("type", 1)
+            mat = mats["paint_red"] if paint_type in (6, 7) else (mats["paint_white"] if paint_type == 3 else mats["paint_yellow"])
+            width = (0.35 if paint_type == 1 else 0.5) * scale
+            if build_line_strip_ribbon(f"Marking_{idx + 1}", pts_xy, 0.004 * scale, width, cols["markings"], mat):
+                counts["markings"] += 1
+
+    # 4. Helipads
+    if props.import_helipads:
+        for idx, heli in enumerate(apt_data.get("helipads", [])):
+            if not isinstance(heli, dict) or "lat" not in heli or "lon" not in heli:
+                continue
+            cx, cy = latlon_to_local_xy(float(heli["lat"]), float(heli["lon"]), origin_lat, origin_lon, scale)
+            length, width = float(heli.get("length_m", 20.0)) * scale, float(heli.get("width_m", 20.0)) * scale
+            hdg_rad = math.radians(float(heli.get("heading", 0.0)))
+            hw, hl = width / 2.0, length / 2.0
+            corners = [(-hw, -hl), (hw, -hl), (hw, hl), (-hw, hl)]
+            rot_corners = [
+                (cx + px * math.cos(hdg_rad) - py * math.sin(hdg_rad), cy + px * math.sin(hdg_rad) + py * math.cos(hdg_rad))
+                for px, py in corners
+            ]
+            if build_complex_polygon(f"Helipad_{heli.get('name', idx + 1)}", [rot_corners], 0.003 * scale, cols["helipads"], mats["helipad"]):
+                counts["helipads"] += 1
+
+    # 5. Gates (1300/1301)
+    if props.import_gates:
+        for gate in apt_data.get("gates", []):
+            if not isinstance(gate, dict) or "lat" not in gate or "lon" not in gate:
+                continue
+            gx, gy = latlon_to_local_xy(float(gate["lat"]), float(gate["lon"]), origin_lat, origin_lon, scale)
+            emp = bpy.data.objects.new(str(gate.get("name", "Gate")), None)
+            emp.empty_display_type = 'ARROWS'
+            emp.empty_display_size = 2.5 * scale
+            emp.location = (gx, gy, 0.005 * scale)
+            emp.rotation_euler = (0, 0, math.radians(-float(gate.get("heading", 0.0))))
+            emp["gate_type"] = str(gate.get("type", "gate"))
+            emp["aircraft"] = str(gate.get("aircraft", "all"))
+            emp["airlines"] = str(gate.get("airlines", ""))
+            cols["gates"].objects.link(emp)
+            counts["gates"] += 1
+
+    # 6. Jetways (1500)
+    if props.import_jetways:
+        for jw in apt_data.get("jetways", []):
+            if not isinstance(jw, dict) or "lat" not in jw or "lon" not in jw:
+                continue
+            jx, jy = latlon_to_local_xy(float(jw["lat"]), float(jw["lon"]), origin_lat, origin_lon, scale)
+            emp = bpy.data.objects.new(str(jw.get("name", "Jetway")), None)
+            emp.empty_display_type = 'SINGLE_ARROW'
+            emp.empty_display_size = 4.0 * scale
+            emp.location = (jx, jy, 0.005 * scale)
+            emp.rotation_euler = (0, 0, math.radians(-float(jw.get("heading", 0.0))))
+            cols["jetways"].objects.link(emp)
+            counts["jetways"] += 1
+
+    # 7. OSM 3D Buildings Query & Generation
+    if props.import_osm_buildings:
+        try:
+            osm_res = fetch_osm_buildings(origin_lat, origin_lon, props.osm_radius)
+            nodes = {}
+            for el in osm_res.get("elements", []):
+                if el["type"] == "node":
+                    nodes[el["id"]] = (el["lat"], el["lon"])
+
+            for el in osm_res.get("elements", []):
+                if el["type"] == "way" and "building" in el.get("tags", {}):
+                    tags = el.get("tags", {})
+                    way_nodes = el.get("nodes", [])
+                    coords_xy = []
+                    for nid in way_nodes:
+                        if nid in nodes:
+                            nlat, nlon = nodes[nid]
+                            coords_xy.append(latlon_to_local_xy(nlat, nlon, origin_lat, origin_lon, scale))
+
+                    if len(coords_xy) >= 3:
+                        is_closed = way_nodes[0] == way_nodes[-1]
+                        if is_closed:
+                            b_name = tags.get("name", f"Building_{el['id']}")
+                            b_height = get_building_height(tags, scale)
+                            if build_complex_polygon(b_name, [coords_xy], 0.0, cols["buildings"], mats["building"], extrude=b_height):
+                                counts["buildings"] += 1
+        except Exception as e:
+            print(f"[!] OSM Building import encountered an error: {e}")
+
+    return counts
+
+
+# --- UI, Tutorials & Operators ---
 
 class AirportOSMSettings(PropertyGroup):
-    search_term: StringProperty(
-        name="Airport",
-        description="Start typing a name, ICAO (e.g. KSFO) or IATA (e.g. SFO) code and pick from the list",
-        default="",
+    dataset_directory: StringProperty(
+        name="Database Folder",
+        description="Select folder containing airports_index.json and chunks/",
+        subtype='DIR_PATH',
     )
-    radius: FloatProperty(
-        name="Search Radius (m)",
-        description="Radius around the airport center to pull features from",
-        default=3000.0,
-        min=200.0,
-        max=20000.0,
+    search_term: StringProperty(
+        name="Target ICAO",
+        description="4-letter ICAO identifier (e.g. KJFK, EGLL, LFPG)",
+        default="KJFK",
     )
     scale: FloatProperty(
         name="Scale",
-        description="Scale factor for generated meshes (1.0 = full scale in meters, 0.1 = default)",
+        description="1.0 = Full scale meters, 0.1 = default viewport scale",
         default=0.1,
         min=0.0001,
-        max=100.0,
+        max=10.0,
+    )
+    license_accepted: BoolProperty(
+        name="I accept GPLv2 terms & mandatory attribution conditions",
+        description="Acknowledge dataset licenses and credit requirements to unlock generation",
+        default=False,
+    )
+    import_runways: BoolProperty(name="Runways", default=True)
+    import_taxiways: BoolProperty(name="Taxiways & Aprons", default=True)
+    import_markings: BoolProperty(name="Markings & Lines", default=True)
+    import_gates: BoolProperty(name="Gates / Ramp Starts", default=True)
+    import_jetways: BoolProperty(name="Jetways (Active Row 1500)", default=True)
+    import_helipads: BoolProperty(name="Helipads", default=True)
+    
+    # OSM Buildings Integration Toggle
+    import_osm_buildings: BoolProperty(
+        name="OSM 3D Buildings",
+        description="Download and extrude building footprints in 3D from OpenStreetMap",
+        default=True,
+    )
+    osm_radius: FloatProperty(
+        name="Building Radius (m)",
+        description="Search radius around airport center for terminal and hangar buildings",
+        default=3500.0,
+        min=500.0,
+        max=15000.0,
     )
     status_text: StringProperty(default="")
-    is_running: BoolProperty(default=False)
-    progress: FloatProperty(default=0.0, min=0.0, max=1.0)
 
 
-class AIRPORTOSM_OT_download_db(Operator):
-    bl_idname = "airportosm.download_db"
-    bl_label = "Update Airport Database"
-    bl_description = "Download/refresh the offline airport database from OurAirports without freezing Blender"
-    bl_options = {"REGISTER"}
+class AIRPORTOSM_OT_open_github(Operator):
+    bl_idname = "airportosm.open_github"
+    bl_label = "Open Dataset GitHub"
+    bl_description = "Open the official Wings Simulations Airport Database repository in your browser"
+    bl_options = {"INTERNAL"}
 
-    _timer = None
-    _thread = None
-    _result_queue = None
+    def execute(self, context):
+        webbrowser.open(GITHUB_REPO_URL)
+        return {"FINISHED"}
+
+
+class AIRPORTOSM_OT_show_tutorial(Operator):
+    bl_idname = "airportosm.show_tutorial"
+    bl_label = "How to Download Database"
+    bl_description = "Step-by-step setup guide for obtaining the global dataset"
+    bl_options = {"INTERNAL"}
+
+    def execute(self, context):
+        return {"FINISHED"}
 
     def invoke(self, context, event):
-        settings = context.scene.airport_osm_settings
-        settings.is_running = True
-        settings.status_text = "Downloading airport database..."
-        self._result_queue = queue.Queue()
-        self._thread = threading.Thread(target=self._download_worker, daemon=True)
-        self._thread.start()
+        return context.window_manager.invoke_props_dialog(self, width=560)
 
-        wm = context.window_manager
-        self._timer = wm.event_timer_add(0.1, window=context.window)
-        wm.modal_handler_add(self)
-        return {"RUNNING_MODAL"}
+    def draw(self, context):
+        layout = self.layout
+        box = layout.box()
+        box.label(text="HOW TO DOWNLOAD & CONFIGURE DATABASE", icon="HELP")
+        
+        col = box.column(align=True)
+        col.label(text="Step 1: Download the Database Repository")
+        col.label(text="  - Option A: Click 'Open GitHub Repo' below, click 'Code' > 'Download ZIP'")
+        col.label(text="  - Option B: git clone https://github.com/WingsSimulations/wsairports-database.git")
+        col.separator()
+        col.label(text="Step 2: Extract & Verify Folder Structure")
+        col.label(text="  Make sure your extracted directory contains:")
+        col.label(text="    • airports_index.json  (Master index file)")
+        col.label(text="    • chunks/              (Folder containing .wscairport chunks)")
+        col.separator()
+        col.label(text="Step 3: Link in Blender")
+        col.label(text="  In the sidebar panel, click the folder icon on 'Database Folder' and select")
+        col.label(text="  the directory containing 'airports_index.json'.")
+        
+        box.separator()
+        box.operator("airportosm.open_github", text="Open GitHub Repository in Browser", icon="URL")
 
-    def _download_worker(self):
-        try:
-            req = urllib.request.Request(
-                AIRPORTS_CSV_URL, headers={"User-Agent": "Blender-Airport-OSM-Importer/1.0"}
-            )
-            with urllib.request.urlopen(req, timeout=120) as resp:
-                raw = resp.read().decode("utf-8", errors="replace")
-            records = parse_airport_csv(raw)
-            self._result_queue.put(("done", records))
-        except Exception as e:
-            self._result_queue.put(("error", str(e)))
 
-    def modal(self, context, event):
-        settings = context.scene.airport_osm_settings
+class AIRPORTOSM_OT_show_license(Operator):
+    bl_idname = "airportosm.show_license"
+    bl_label = "Dataset License & DMCA Terms"
+    bl_description = "View data origin licenses, terms of use, and legal attribution requirements"
+    bl_options = {"INTERNAL"}
 
-        if event.type == 'TIMER':
-            try:
-                status, payload = self._result_queue.get_nowait()
-            except queue.Empty:
-                return {"RUNNING_MODAL"}
+    def execute(self, context):
+        return {"FINISHED"}
 
-            self._finish(context)
+    def invoke(self, context, event):
+        return context.window_manager.invoke_props_dialog(self, width=560)
 
-            if status == "error":
-                settings.status_text = f"Download failed: {payload}"
-                self.report({"ERROR"}, f"Failed to download airport database: {payload}")
-                return {"CANCELLED"}
-
-            records = payload
-            cache = {"downloaded_at": time.time(), "count": len(records), "airports": records}
-            with open(get_cache_path(), "w", encoding="utf-8") as f:
-                json.dump(cache, f)
-
-            load_airport_database()
-            refresh_search_collection(context)
-            settings.status_text = f"Airport database ready: {len(records)} airports"
-            self.report({"INFO"}, settings.status_text)
-            return {"FINISHED"}
-
-        return {"RUNNING_MODAL"}
-
-    def _finish(self, context):
-        settings = context.scene.airport_osm_settings
-        settings.is_running = False
-        wm = context.window_manager
-        if self._timer:
-            wm.event_timer_remove(self._timer)
-            self._timer = None
+    def draw(self, context):
+        layout = self.layout
+        box = layout.box()
+        box.label(text="MANDATORY LEGAL NOTICE & GPLv2 TERMS", icon="LOCKED")
+        
+        col = box.column(align=True)
+        col.label(text="This dataset contains compiled scenery information derived from:")
+        col.label(text="1. X-Plane Airport Scenery Gateway (C) Laminar Research (GPLv2)")
+        col.label(text="2. Wings Simulations Airport Database (C) 2026 Wings Simulations (GPLv2)")
+        col.label(text="3. OpenStreetMap Buildings (C) OpenStreetMap contributors (ODbL)")
+        col.separator()
+        col.label(text="ATTRIBUTION REQUIREMENT & DMCA WARNING:", icon="ERROR")
+        col.label(text="Any 3D scenery, exports, game levels, or derivative assets generated")
+        col.label(text="with this addon MUST give clear credit in documentation/metadata to:")
+        col.label(text="  - Laminar Research / Gateway Scenery Authors")
+        col.label(text="  - Wings Simulations")
+        col.label(text="  - OpenStreetMap contributors")
+        col.separator()
+        col.label(text="Unattributed redistribution or commercial packaging without attribution")
+        col.label(text="violates the GPLv2 license and is subject to immediate DMCA takedown.")
 
 
 class AIRPORTOSM_OT_generate(Operator):
     bl_idname = "airportosm.generate"
-    bl_label = "Generate Airport Model"
-    bl_description = "Look up the airport and build a base 3D model, assembling objects live in the viewport"
+    bl_label = "Generate Airport"
+    bl_description = "Locate airport in chunked database and generate 3D model with OSM buildings"
     bl_options = {"REGISTER", "UNDO"}
 
-    _timer = None
-    _thread = None
-    _result_queue = None
-    _tasks = None
-    _task_index = 0
-    _cols = None
-    _mats = None
-    _counts = None
-    _phase = "resolving"
-    _origin_lat = None
-    _origin_lon = None
-    _scale = 0.1
-
-    TASKS_PER_TICK = 4
-
-    def invoke(self, context, event):
+    def execute(self, context):
         settings = context.scene.airport_osm_settings
-        term = settings.search_term.strip()
-        if not term:
-            self.report({"ERROR"}, "Pick an airport from the search field")
+
+        if not settings.license_accepted:
+            self.report({"ERROR"}, "You must accept the License & DMCA Attribution Terms to generate models")
             return {"CANCELLED"}
 
-        if not _AIRPORT_DB:
-            load_airport_database()
+        db_folder = bpy.path.abspath(settings.dataset_directory).strip()
+        icao = settings.search_term.strip().upper()
 
-        rec = _AIRPORT_DB.get(term)
-        if rec is None:
-            term_lower = term.lower()
-            for key, r in _AIRPORT_DB.items():
-                if (
-                    term_lower == r.get("icao", "").lower()
-                    or term_lower == r.get("iata", "").lower()
-                    or term_lower in r.get("name", "").lower()
-                ):
-                    rec = r
-                    break
-
-        self._tasks = None
-        self._task_index = 0
-        self._counts = {"runway": 0, "taxiway": 0, "apron": 0, "building": 0}
-        self._result_queue = queue.Queue()
-        self._scale = settings.scale
-        settings.is_running = True
-        settings.progress = 0.0
-
-        if rec is not None:
-            self._origin_lat, self._origin_lon = rec["lat"], rec["lon"]
-            self._phase = "fetching_detail"
-            settings.status_text = f"Fetching features around {rec['name']}..."
-            self._thread = threading.Thread(
-                target=self._detail_worker, args=(self._origin_lat, self._origin_lon, settings.radius), daemon=True
-            )
-        else:
-            self._phase = "resolving"
-            settings.status_text = f"Resolving '{term}' via Overpass..."
-            self._thread = threading.Thread(target=self._resolve_worker, args=(term,), daemon=True)
-
-        self._thread.start()
-        wm = context.window_manager
-        self._timer = wm.event_timer_add(0.05, window=context.window)
-        wm.modal_handler_add(self)
-        return {"RUNNING_MODAL"}
-
-    def _resolve_worker(self, term):
-        try:
-            find_query = build_query(term)
-            result = run_overpass_query(find_query)
-            elements = result.get("elements", [])
-            if not elements:
-                self._result_queue.put(("error", f"No airport found matching '{term}'"))
-                return
-            el = elements[0]
-            if el["type"] == "node":
-                lat, lon = el["lat"], el["lon"]
-            else:
-                center = el.get("center")
-                if not center:
-                    self._result_queue.put(("error", "Could not resolve airport center coordinates"))
-                    return
-                lat, lon = center["lat"], center["lon"]
-            self._result_queue.put(("resolved", (lat, lon)))
-        except Exception as e:
-            self._result_queue.put(("error", str(e)))
-
-    def _detail_worker(self, lat, lon, radius):
-        try:
-            detail_query = build_detail_query(lat, lon, radius)
-            detail_result = run_overpass_query(detail_query)
-            self._result_queue.put(("detail", detail_result))
-        except Exception as e:
-            self._result_queue.put(("error", str(e)))
-
-    def modal(self, context, event):
-        settings = context.scene.airport_osm_settings
-
-        if event.type == 'ESC':
-            self._finish(context)
-            settings.status_text = "Cancelled"
+        if not db_folder or not os.path.isdir(db_folder):
+            self.report({"ERROR"}, "Please select the root folder containing airports_index.json")
             return {"CANCELLED"}
 
-        if event.type != 'TIMER':
-            return {"PASS_THROUGH"}
+        if not icao:
+            self.report({"ERROR"}, "Please enter a valid airport ICAO code")
+            return {"CANCELLED"}
 
-        if self._phase in ("resolving", "fetching_detail"):
-            try:
-                status, payload = self._result_queue.get_nowait()
-            except queue.Empty:
-                return {"RUNNING_MODAL"}
+        apt_data, err = fetch_airport_from_chunk(db_folder, icao)
+        if err:
+            self.report({"ERROR"}, err)
+            settings.status_text = err
+            return {"CANCELLED"}
 
-            if status == "error":
-                self._finish(context)
-                settings.status_text = f"Failed: {payload}"
-                self.report({"ERROR"}, payload)
-                return {"CANCELLED"}
-
-            if status == "resolved":
-                lat, lon = payload
-                self._origin_lat, self._origin_lon = lat, lon
-                self._phase = "fetching_detail"
-                settings.status_text = "Fetching airport features..."
-                self._thread = threading.Thread(
-                    target=self._detail_worker, args=(lat, lon, settings.radius), daemon=True
-                )
-                self._thread.start()
-                return {"RUNNING_MODAL"}
-
-            if status == "detail":
-                osm = OSMData(payload.get("elements", []))
-                if not osm.ways:
-                    self._finish(context)
-                    settings.status_text = "No aeroway/building features found in range"
-                    self.report({"WARNING"}, settings.status_text)
-                    return {"CANCELLED"}
-
-                self._tasks = build_task_list(osm, self._origin_lat, self._origin_lon, self._scale)
-                self._cols = prepare_collections()
-                self._mats = (
-                    get_or_create_material("Runway_Asphalt", (0.05, 0.05, 0.055)),
-                    get_or_create_material("Taxiway_Asphalt", (0.08, 0.08, 0.09)),
-                    get_or_create_material("Apron_Concrete", (0.55, 0.54, 0.5)),
-                    get_or_create_material("Building_Generic", (0.6, 0.6, 0.62)),
-                )
-                self._task_index = 0
-                self._phase = "building"
-                settings.status_text = f"Building {len(self._tasks)} features..."
-                return {"RUNNING_MODAL"}
-
-            return {"RUNNING_MODAL"}
-
-        if self._phase == "building":
-            total = len(self._tasks)
-            if total == 0:
-                self._finish(context)
-                settings.status_text = "No buildable features found"
-                self.report({"WARNING"}, settings.status_text)
-                return {"CANCELLED"}
-
-            end = min(self._task_index + self.TASKS_PER_TICK, total)
-            for i in range(self._task_index, end):
-                kind = execute_task(self._tasks[i], self._cols, self._mats, self._scale)
-                if kind:
-                    self._counts[kind] += 1
-            self._task_index = end
-            settings.progress = self._task_index / total
-
-            for area in context.screen.areas:
-                if area.type == 'VIEW_3D':
-                    area.tag_redraw()
-
-            if self._task_index >= total:
-                self._finish(context)
-                c = self._counts
-                settings.status_text = (
-                    f"Done: {c['runway']} runways, {c['taxiway']} taxiways, "
-                    f"{c['apron']} apron pieces, {c['building']} buildings"
-                )
-                self.report({"INFO"}, settings.status_text)
-                return {"FINISHED"}
-
-            return {"RUNNING_MODAL"}
-
-        return {"RUNNING_MODAL"}
-
-    def _finish(self, context):
-        settings = context.scene.airport_osm_settings
-        settings.is_running = False
-        wm = context.window_manager
-        if self._timer:
-            wm.event_timer_remove(self._timer)
-            self._timer = None
+        counts = generate_wsairport_model(apt_data, scale=settings.scale, props=settings)
+        msg = f"Generated {icao}: {counts['runways']} runways, {counts['taxiways']} taxiways, {counts['markings']} markings, {counts['gates']} gates, {counts['buildings']} OSM buildings"
+        settings.status_text = msg
+        self.report({"INFO"}, msg)
+        return {"FINISHED"}
 
 
 class AIRPORTOSM_PT_panel(Panel):
-    bl_label = "Airport OSM Importer"
+    bl_label = "Airport Importer Pro"
     bl_idname = "AIRPORTOSM_PT_panel"
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
-    bl_category = "Airport OSM"
+    bl_category = "Airport Pro"
 
     def draw(self, context):
         layout = self.layout
         settings = context.scene.airport_osm_settings
-        wm = context.window_manager
 
-        db_count = len(_AIRPORT_DB)
+        # Database Setup & Guide Box
+        guide_box = layout.box()
+        guide_box.label(text="Setup & Database Guide:", icon="HELP")
+        row = guide_box.row(align=True)
+        row.operator("airportosm.show_tutorial", text="Setup Tutorial", icon="INFO")
+        row.operator("airportosm.open_github", text="Download DB", icon="URL")
+
+        # Database Selection Card
         box = layout.box()
-        if db_count:
-            last_updated = database_last_updated_str()
-            box.label(text=f"Database: {db_count} airports", icon="CHECKMARK")
-            if last_updated:
-                box.label(text=f"Updated: {last_updated}")
+        box.label(text="WSAirports Database:", icon="WORLD_DATA")
+        box.prop(settings, "dataset_directory")
+
+        if _WSA_INDEX and _LOADED_DB_PATH == bpy.path.abspath(settings.dataset_directory).strip():
+            box.label(text=f"Index Ready: {len(_WSA_INDEX):,} airports", icon="CHECKMARK")
         else:
-            box.label(text="No offline database yet", icon="ERROR")
-        box.operator(
-            "airportosm.download_db",
-            icon="IMPORT",
-            text="Update Airport Database" if db_count else "Download Airport Database",
-        )
+            box.label(text="Select folder with airports_index.json", icon="INFO")
+
+        box.separator()
+        box.prop(settings, "search_term")
+
+        # Layer toggles
+        layer_box = layout.box()
+        layer_box.label(text="Include Layers:")
+        col = layer_box.column(align=True)
+        col.prop(settings, "import_runways")
+        col.prop(settings, "import_taxiways")
+        col.prop(settings, "import_markings")
+        col.prop(settings, "import_gates")
+        col.prop(settings, "import_jetways")
+        col.prop(settings, "import_helipads")
+
+        # OSM 3D Buildings Sub-box
+        osm_box = layout.box()
+        osm_box.label(text="OpenStreetMap Integration:", icon="COMMUNITY")
+        osm_box.prop(settings, "import_osm_buildings")
+        if settings.import_osm_buildings:
+            osm_box.prop(settings, "osm_radius")
 
         layout.separator()
-        layout.label(text="Airport:")
-        layout.prop_search(settings, "search_term", wm, "airport_osm_items", text="", icon="VIEWZOOM")
-        layout.label(text="Type a name, ICAO or IATA code to search", icon="INFO")
-
-        layout.prop(settings, "radius")
         layout.prop(settings, "scale")
 
-        layout.separator()
-        row = layout.row()
-        row.enabled = not settings.is_running
-        row.operator("airportosm.generate", icon="MESH_GRID")
+        # License, Legal Warning & Acceptance Card
+        legal_box = layout.box()
+        legal_box.alert = not settings.license_accepted
+        legal_box.label(text="Mandatory Attribution Notice:", icon="GHOST_ENABLED")
+        
+        row = legal_box.row()
+        row.operator("airportosm.show_license", text="View Full License & Terms", icon="TEXT")
+        
+        legal_box.prop(settings, "license_accepted")
+        if not settings.license_accepted:
+            legal_box.label(text="* Unattributed work is subject to DMCA takedown", icon="ERROR")
 
-        if settings.is_running:
-            layout.prop(settings, "progress", text="Progress", slider=True)
+        layout.separator()
+        
+        # Generation Button (Enabled only when terms are accepted)
+        gen_row = layout.row()
+        gen_row.enabled = settings.license_accepted
+        gen_row.operator("airportosm.generate", icon="MESH_GRID", text="Generate Airport Model")
+
         if settings.status_text:
             layout.label(text=settings.status_text)
 
-        layout.separator()
-        box = layout.box()
-        box.label(text="Output collections:")
-        box.label(text="• Runways")
-        box.label(text="• Taxiways")
-        box.label(text="• Aprons_Tarmac")
-        box.label(text="• Buildings")
-
 
 classes = (
-    AirportSearchItem,
     AirportOSMSettings,
-    AIRPORTOSM_OT_download_db,
+    AIRPORTOSM_OT_open_github,
+    AIRPORTOSM_OT_show_tutorial,
+    AIRPORTOSM_OT_show_license,
     AIRPORTOSM_OT_generate,
     AIRPORTOSM_PT_panel,
 )
@@ -787,18 +759,9 @@ def register():
     for cls in classes:
         bpy.utils.register_class(cls)
     bpy.types.Scene.airport_osm_settings = PointerProperty(type=AirportOSMSettings)
-    bpy.types.WindowManager.airport_osm_items = CollectionProperty(type=AirportSearchItem)
-
-    count = load_airport_database()
-    if count:
-        try:
-            refresh_search_collection(bpy.context)
-        except Exception:
-            pass
 
 
 def unregister():
-    del bpy.types.WindowManager.airport_osm_items
     del bpy.types.Scene.airport_osm_settings
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)
